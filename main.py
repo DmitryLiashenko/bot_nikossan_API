@@ -1,108 +1,123 @@
 import os
-from io import BytesIO
-import logging
+import uuid
 import replicate
 import requests
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    filters,
+)
 from dotenv import load_dotenv
-from telegram import Bot
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
-# Включаем логгирование для отладки
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Загружаем токены из .env
+# Загрузка переменных окружения
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 
-if not TELEGRAM_TOKEN or not REPLICATE_TOKEN:
-    logger.error("Добавь TELEGRAM_BOT_TOKEN и REPLICATE_API_TOKEN в .env файл")
-    exit(1)
+# Настройка клиента Replicate
+replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# Настраиваем Replicate API
-os.environ["REPLICATE_API_TOKEN"] = REPLICATE_TOKEN
+# Словарь для хранения фото пользователей
+user_photos = {}
 
-# Инициализируем Telegram бота
-updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
 
-def start(update, context):
-    update.message.reply_text(
-        "Привет! Отправь мне фото с подписью, например: 'Добавь жалюзи' — и я покажу результат."
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Отправь мне фото окна, и я покажу, как на нём будут смотреться солнцезащитные системы. 🌞🪟"
     )
 
-def handle_photo(update, context):
-    message = update.message
-    prompt = message.caption
 
-    if not prompt:
-        message.reply_text("Пожалуйста, отправь фото **с подписью**, описывающей, что нужно дорисовать.")
+# Обработка отправленного фото
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    photo = update.message.photo[-1]  # Самое большое
+    user_photos[user_id] = photo.file_id
+
+    keyboard = [
+        [InlineKeyboardButton("Жалюзи день/ночь", callback_data="daynight")],
+        [InlineKeyboardButton("Шторы", callback_data="curtains")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "Выбери тип солнцезащитной системы:", reply_markup=reply_markup
+    )
+
+
+# Обработка нажатия кнопки
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    file_id = user_photos.get(user_id)
+
+    if not file_id:
+        await query.edit_message_text("Сначала отправь фото.")
         return
 
-    photo = message.photo[-1]
-    file_id = photo.file_id
-    os.makedirs('downloads', exist_ok=True)
-    file_path = f"downloads/{file_id}.jpg"
+    prompt = ""
+    if query.data == "daynight":
+        prompt = "add modern day-night blinds on the window"
+    elif query.data == "curtains":
+        prompt = "add light beige curtains on the window"
 
     try:
-        photo_file = context.bot.get_file(file_id)
-        photo_file.download(file_path)
+        await query.edit_message_text("Обрабатываю изображение... 🧠")
+
+        output_url = await process_with_flux(context.bot, file_id, prompt)
+
+        await context.bot.send_photo(chat_id=user_id, photo=output_url)
+
     except Exception as e:
-        logger.error(f"Ошибка при загрузке фото: {e}")
-        message.reply_text("Не удалось сохранить изображение.")
-        return
+        await context.bot.send_message(
+            chat_id=user_id, text=f"Ошибка при обработке: {e}"
+        )
 
-    message.reply_text("Обрабатываю изображение с помощью ИИ...")
 
-    # Пытаемся передать локальный файл напрямую в Replicate
-    try:
-        with open(file_path, "rb") as img:
-            output = replicate.run(
-                "black-forest-labs/flux-kontext-pro",
-                input={"prompt": prompt, "input_image": img}
-            )
-    except Exception as e:
-        logger.warning(f"Ошибка при передаче файла напрямую: {e}")
-        # Фолбэк через загрузку на transfer.sh
-        try:
-            with open(file_path, 'rb') as f:
-                filename = os.path.basename(file_path)
-                response = requests.put(f"https://transfer.sh/{filename}", data=f)
-            if response.status_code == 200:
-                image_url = response.text.strip()
-                logger.info(f"Загружено на transfer.sh: {image_url}")
-                output = replicate.run(
-                    "black-forest-labs/flux-kontext-pro",
-                    input={"prompt": prompt, "input_image": image_url}
-                )
-            else:
-                message.reply_text("Ошибка при загрузке изображения.")
-                return
-        except Exception as e2:
-            logger.error(f"Ошибка фолбэка: {e2}")
-            message.reply_text("Не удалось отправить изображение на обработку.")
-            return
+# Функция обработки через Replicate с сохранением локального файла
+async def process_with_flux(bot, file_id: str, prompt: str) -> str:
+    tg_file = await bot.get_file(file_id)
+    file_bytes = await tg_file.download_as_bytearray()
 
-    # Отправляем обработанное изображение
-    try:
-        result = output[0] if isinstance(output, list) else output
-        image_bytes = result.read()
-        bio = BytesIO(image_bytes)
-        bio.name = "result.png"
-        bio.seek(0)
-        context.bot.send_photo(chat_id=message.chat_id, photo=bio)
-    except Exception as e:
-        logger.error(f"Ошибка при отправке результата: {e}")
-        message.reply_text("Что-то пошло не так при получении изображения.")
-        return
+    # Сохраняем файл локально
+    filename = f"temp_{uuid.uuid4().hex}.jpg"
+    with open(filename, "wb") as f:
+        f.write(file_bytes)
 
-# Регистрируем команды
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(MessageHandler(Filters.photo, handle_photo))
+    # Загружаем на file.io временно (можно заменить позже на другой способ)
+    with open(filename, "rb") as f:
+        response = requests.post("https://file.io", files={"file": f})
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("success"):
+            raise Exception("Ошибка загрузки изображения")
+        image_url = data["link"]
 
-if __name__ == '__main__':
+    # Удаляем файл после загрузки
+    os.remove(filename)
+
+    # Отправляем в Replicate
+    output = replicate_client.run(
+        "black-forest-labs/flux-kontext-pro",
+        input={"image": image_url, "prompt": prompt},
+    )
+    return output
+
+
+# Запуск бота
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(handle_button))
+
     print("Бот запущен...")
-    updater.start_polling()
-    updater.idle()
+    app.run_polling()
