@@ -1,8 +1,11 @@
 import os
-import uuid
-import replicate
-import requests
+import logging
+import asyncio
+from io import BytesIO
 
+from PIL import Image, ImageDraw
+import httpx
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,106 +15,136 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from dotenv import load_dotenv
 
-# Загрузка переменных окружения
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Настройка клиента Replicate
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Словарь для хранения фото пользователей
 user_photos = {}
 
 
-# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Отправь мне фото окна, и я покажу, как на нём будут смотреться солнцезащитные системы. 🌞🪟"
+        "Привет! Отправь мне фото окна, и я покажу, как будут выглядеть шторы. 🌞🪟"
     )
 
 
-# Обработка отправленного фото
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    photo = update.message.photo[-1]  # Самое большое
-    user_photos[user_id] = photo.file_id
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_path = f"user_{user_id}.png"
+    await file.download_to_drive(file_path)
+    user_photos[user_id] = file_path
 
     keyboard = [
-        [InlineKeyboardButton("Жалюзи день/ночь", callback_data="daynight")],
-        [InlineKeyboardButton("Шторы", callback_data="curtains")],
+        [InlineKeyboardButton("Жалюзи горизонтальные", callback_data="horizontal")],
+        [InlineKeyboardButton("Шторы день/ночь", callback_data="daynight")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "Выбери тип солнцезащитной системы:", reply_markup=reply_markup
-    )
+    await update.message.reply_text("Выбери тип штор:", reply_markup=reply_markup)
 
 
-# Обработка нажатия кнопки
+def create_mask(image_path: str) -> str:
+    """
+    Автоматически создаём маску.
+    Для простоты — чёрно-белое изображение
+    с белым прямоугольником по центру (окно).
+    """
+    with Image.open(image_path) as img:
+        mask = Image.new("L", img.size, 0)  # Чёрный фон
+        draw = ImageDraw.Draw(mask)
+
+        # Пример — прямоугольник по центру 80% ширины и 70% высоты
+        w, h = img.size
+        rect_w, rect_h = int(w * 0.8), int(h * 0.7)
+        left = (w - rect_w) // 2
+        top = (h - rect_h) // 2
+        right = left + rect_w
+        bottom = top + rect_h
+        draw.rectangle([left, top, right, bottom], fill=255)  # Белый прямоугольник
+
+        mask_path = image_path.replace(".png", "_mask.png")
+        mask.save(mask_path)
+        return mask_path
+
+
+async def generate_image_with_openai(image_path: str, prompt: str) -> str:
+    mask_path = create_mask(image_path)
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+
+    files = {
+        "model": (None, "dall-e-2"),
+        "image": (os.path.basename(image_path), open(image_path, "rb"), "image/png"),
+        "mask": (os.path.basename(mask_path), open(mask_path, "rb"), "image/png"),
+        "prompt": (None, prompt),
+        "n": (None, "1"),
+        "size": (None, "512x512"),
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/images/edits",
+            headers=headers,
+            files=files,
+        )
+
+    if response.status_code == 200:
+        result = response.json()
+        image_url = result["data"][0]["url"]
+
+        output_path = image_path.replace(".png", "_result.png")
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(image_url)
+            with open(output_path, "wb") as out_file:
+                out_file.write(resp.content)
+        return output_path
+    else:
+        logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
+        return None
+
+
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user_id = query.from_user.id
-    file_id = user_photos.get(user_id)
+    choice = query.data
 
-    if not file_id:
-        await query.edit_message_text("Сначала отправь фото.")
+    photo_path = user_photos.get(user_id)
+    if not photo_path:
+        await query.edit_message_text("Сначала отправь фото окна.")
         return
 
-    prompt = ""
-    if query.data == "daynight":
-        prompt = "add modern day-night blinds on the window"
-    elif query.data == "curtains":
-        prompt = "add light beige curtains on the window"
+    prompt_map = {
+        "horizontal": "Добавь на окно реалистичные горизонтальные жалюзи, подходящие под перспективу и освещение.",
+        "daynight": "Добавь на окно реалистичные шторы день/ночь, подходящие под интерьер.",
+    }
+    prompt = prompt_map.get(choice, "Добавь на окно шторы.")
+
+    await query.edit_message_text("Обрабатываю изображение... 🧠")
 
     try:
-        await query.edit_message_text("Обрабатываю изображение... 🧠")
-
-        output_url = await process_with_flux(context.bot, file_id, prompt)
-
-        await context.bot.send_photo(chat_id=user_id, photo=output_url)
-
+        result_path = await generate_image_with_openai(photo_path, prompt)
+        if result_path:
+            with open(result_path, "rb") as img:
+                await context.bot.send_photo(chat_id=user_id, photo=img)
+        else:
+            await context.bot.send_message(
+                chat_id=user_id, text="Не удалось обработать изображение."
+            )
     except Exception as e:
+        logger.error(f"Ошибка при обработке изображения: {e}")
         await context.bot.send_message(
-            chat_id=user_id, text=f"Ошибка при обработке: {e}"
+            chat_id=user_id, text="Произошла ошибка при обработке изображения."
         )
 
 
-# Функция обработки через Replicate с сохранением локального файла
-async def process_with_flux(bot, file_id: str, prompt: str) -> str:
-    tg_file = await bot.get_file(file_id)
-    file_bytes = await tg_file.download_as_bytearray()
-
-    # Сохраняем файл локально
-    filename = f"temp_{uuid.uuid4().hex}.jpg"
-    with open(filename, "wb") as f:
-        f.write(file_bytes)
-
-    # Загружаем на file.io временно (можно заменить позже на другой способ)
-    with open(filename, "rb") as f:
-        response = requests.post("https://file.io", files={"file": f})
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("success"):
-            raise Exception("Ошибка загрузки изображения")
-        image_url = data["link"]
-
-    # Удаляем файл после загрузки
-    os.remove(filename)
-
-    # Отправляем в Replicate
-    output = replicate_client.run(
-        "black-forest-labs/flux-kontext-pro",
-        input={"image": image_url, "prompt": prompt},
-    )
-    return output
-
-
-# Запуск бота
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
